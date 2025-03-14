@@ -177,12 +177,56 @@ class ContractSpider:
         # 初始化WebDriver
         self.driver = self._setup_webdriver()
         
+        # WebDriver会话状态标志
+        self.driver_session_valid = True
+        
         # 初始化集合和计数器
         self.visited_urls = set()
         self.to_visit_urls = set([self.base_url])
         self.contract_pages = set()
         self.extracted_addresses = set()
         self.address_contexts = []
+        
+        # 混合黑名单规则（支持通配符）
+        # 格式：
+        # 1. "domain.com/path/*" - 匹配特定域名下的特定路径及其子路径
+        # 2. "domain.com/path" - 精确匹配特定URL（不包括子路径）
+        # 3. "blog.*" - 匹配所有以blog开头的域名
+        # 4. "*.example.com" - 匹配example.com的所有子域名
+        # 5. "*/path" - 匹配任何域名下的特定路径
+        self.mixed_blacklist = [
+            # 基础黑名单规则
+            "blog.*",         # 博客子域名
+            "forum.*",        # 论坛子域名
+            "community.*",    # 社区子域名
+            "discuss.*",      # 讨论子域名
+            "chat.*",         # 聊天子域名
+            "research.lido.*",     # 研究子域名lido
+            
+            # 路径黑名单规则
+            "*/t/*",           # 论坛主题路径
+            "*/forum/*",       # 论坛路径
+            "*/forums/*",      # 论坛路径
+            "*/community/*",   # 社区路径
+            "*/blog/*",        # 博客路径
+            "*/blogs/*",       # 博客路径
+            "*/news/*",        # 新闻路径
+            "*/article/*",     # 文章路径
+            "*/articles/*",    # 文章路径
+            "*/post/*",        # 帖子路径
+            "*/posts/*",       # 帖子路径
+            "*/discussion/*",  # 讨论路径
+            "*/discussions/*", # 讨论路径
+            "*/comment/*",     # 评论路径
+            "*/comments/*",    # 评论路径
+            
+            # 示例：屏蔽Uniswap的explore页面
+            # "app.uniswap.org/explore/*",  # 屏蔽explore及其所有子页面
+            # "app.uniswap.org/explore",    # 仅精确匹配explore页面（不含子页面）
+            "app.uniswap.org/explore/*",
+        ]
+        
+        logger.info(f"已加载 {len(self.mixed_blacklist)} 个黑名单规则")
         
         # 黑洞地址列表 - 这些地址将被过滤掉
         self.blackhole_addresses = {
@@ -329,19 +373,33 @@ class ContractSpider:
         # 合并所有可能的文档URL
         potential_docs_urls = docs_subdomains + docs_paths
         
+        # 过滤掉黑名单URL
+        filtered_docs_urls = []
+        for url in potential_docs_urls:
+            if not self._is_blacklisted(url):
+                filtered_docs_urls.append(url)
+            else:
+                logger.debug(f"跳过黑名单文档URL: {url}")
+        
+        logger.info(f"过滤后保留 {len(filtered_docs_urls)}/{len(potential_docs_urls)} 个潜在文档URL")
+        
         # 尝试获取站点地图
         sitemap_urls = self._get_sitemap_urls(self.base_url)
         if sitemap_urls:
             logger.info(f"从站点地图中发现 {len(sitemap_urls)} 个URL")
             # 过滤站点地图URL，只保留可能包含合约信息的URL
             filtered_sitemap_urls = self._filter_contract_related_urls(sitemap_urls)
+            # 再次过滤，排除黑名单URL
+            filtered_sitemap_urls = [url for url in filtered_sitemap_urls if not self._is_blacklisted(url)]
+            # 过滤不同域名的URL，只保留与初始URL相同一级域名的链接
+            filtered_sitemap_urls = [url for url in filtered_sitemap_urls if self._is_same_root_domain(url, self.base_url)]
             logger.info(f"过滤后保留 {len(filtered_sitemap_urls)} 个可能包含合约信息的URL")
             # 将过滤后的URL添加到待访问列表
             self.to_visit_urls.update(filtered_sitemap_urls)
         
         # 并行检查所有可能的文档URL
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(self._check_url_exists, url): url for url in potential_docs_urls}
+            futures = {executor.submit(self._check_url_exists, url): url for url in filtered_docs_urls}
             for future in concurrent.futures.as_completed(futures):
                 url = futures[future]
                 try:
@@ -352,7 +410,12 @@ class ContractSpider:
                         # 尝试获取该文档页面的站点地图
                         doc_sitemap_urls = self._get_sitemap_urls(url)
                         if doc_sitemap_urls:
+                            # 过滤站点地图URL
                             filtered_doc_urls = self._filter_contract_related_urls(doc_sitemap_urls)
+                            # 再次过滤，排除黑名单URL
+                            filtered_doc_urls = [u for u in filtered_doc_urls if not self._is_blacklisted(u)]
+                            # 过滤不同域名的URL，只保留与初始URL相同一级域名的链接
+                            filtered_doc_urls = [u for u in filtered_doc_urls if self._is_same_root_domain(u, self.base_url)]
                             logger.info(f"从文档站点地图中发现 {len(filtered_doc_urls)} 个可能包含合约信息的URL")
                             self.to_visit_urls.update(filtered_doc_urls)
                 except Exception as e:
@@ -470,6 +533,11 @@ class ContractSpider:
         ]
         
         for url in urls:
+            # 首先检查URL是否在黑名单中
+            if self._is_blacklisted(url):
+                logger.debug(f"跳过黑名单URL: {url}")
+                continue
+                
             url_lower = url.lower()
             # 检查URL是否包含合约相关关键词
             if any(keyword in url_lower for keyword in contract_keywords):
@@ -492,7 +560,7 @@ class ContractSpider:
             "contracts", "contract", 
             "addresses", "address",
             "deployments", "deployment", "deployed",
-            "smart-contracts", "api"
+            "smart-contracts", "api", "deployed-contracts"
         ]
         
         # 二级路径关键词
@@ -578,11 +646,17 @@ class ContractSpider:
             
             # 只过滤完全不同根域名的链接
             if href_root_domain != current_root_domain:
+                logger.debug(f"跳过不同域名URL: {full_url}, 当前域名: {current_root_domain}")
                 continue
             
             # 标准化URL
             full_url = full_url.split('#')[0]  # 移除URL片段
             full_url = full_url.split('?')[0]  # 移除查询参数
+            
+            # 检查URL是否在黑名单中
+            if self._is_blacklisted(full_url):
+                logger.debug(f"跳过黑名单URL: {full_url}")
+                continue
             
             urls.add(full_url)
         
@@ -613,7 +687,7 @@ class ContractSpider:
         
         # 根据地址数量评分
         if len(addresses) > 0:
-            score += min(len(addresses) * 4, 40)  # 最多加30分
+            score += min(len(addresses) * 4, 40)  # 最多加40分
         
         # 根据标题评分
         title = soup.title.string.lower() if soup.title else ""
@@ -632,7 +706,7 @@ class ContractSpider:
         """判断页面是否为合约页面"""
         score = self._calculate_page_score(soup, url, addresses)
         
-        if score >= 60:
+        if score >= 75:
             logger.info(f"已确认合约页面 (分数: {score}): {url}")
             return True
         elif score <= 10:
@@ -643,10 +717,10 @@ class ContractSpider:
                 return self._ask_openai(soup, url)
             else:
                 # 无OpenAI API，保守判断
-                return score >= 50
+                return score >= 70
     
     def _ask_openai(self, soup: BeautifulSoup, url: str) -> bool:
-        """从<lock_do_not_change_this_code_start>开始的如下代码到<lock_do_not_change_this_code_end>不允许AI修改"""
+        """从<lock_do_not_change_this_code_start>开始的如下代码到<lock_do_not_change_this_code_end>锁定代码不允许修改"""
         #<lock_do_not_change_this_code_start>
         if not self.openai_api_key:
             return False
@@ -661,7 +735,8 @@ class ContractSpider:
         2. 如果页面中没有明确是公示官方智能合约部署地址，但是有提到的智能合约地址数量大于0，且不是测试地址、非正式地址、演示地址、demo地址、恶意黑名单地址等，则判断为是合约页面
         3. 如果页面中没有明确是公示官方智能合约部署地址，但是有提到的智能合约地址数量大于0，且是测试地址、非正式地址、演示地址、demo地址、恶意黑名单地址等，则判断为不是合约页面
         4. 如果页面中明确公示了官方智能合约部署地址，但是地址数量为0，则判断为不是合约页面
-        5. 其他情况你可以根据你的判断给出结果
+        5. 如果页面是属于论坛性质或者可以由外部用户来提交内容的页面，则判断为不是合约页面，因为我们只关注官方公布的合约地址
+        6. 其他情况你可以根据你的判断给出结果
 URL: {url}
 内容: {page_content[:min(len(page_content), self.openai_max_context - 1000)]}...
 你的回复只能是"yes"或者"no"的判定结果，不需要向我做任何解释，也不需要向我展示任何思考过程，无论任何时候你的回答只能是"yes"或者"no"这两个英文单词中的一个，
@@ -700,7 +775,7 @@ URL: {url}
             # 对于连接错误，尝试使用基于分数的判断作为备选
             score = self._calculate_page_score(soup, url, self._extract_addresses(str(soup)))
             logger.info(f"由于API错误，使用分数判断: {score}/50")
-            return score >= 40  # 使用更高的阈值作为保守判断
+            return score >= 70  # 使用更高的阈值作为保守判断
         
         return False
     
@@ -729,7 +804,7 @@ URL: {url}
                 continue
                 
             # 检查地址前缀 - 过滤掉以大量0开头但不是特定黑洞地址的地址
-            # 这里的逻辑是：如果地址以8个或更多0开头，但不是标准的黑洞地址（全0或特定格式），可能是无效地址
+            # 这里的逻辑是：如果地址以18个或更多0开头，但不是标准的黑洞地址（全0或特定格式），可能是无效地址
             if addr_lower.startswith('0x000000000000000000') and addr_lower not in self.blackhole_addresses:
                 logger.debug(f"跳过可疑前缀地址: {addr}")
                 continue
@@ -897,10 +972,7 @@ URL: {url}
                 
                 # 尝试访问已知可能包含合约地址的页面
                 potential_contract_pages = [
-                    "https://aave.com/docs/developers/gho",  # Aave GHO合约页面
-                    "https://docs.aave.com/developers/deployed-contracts/deployed-contracts",
-                    "https://aave.com/docs/developers/deployed-contracts",
-                    "https://aave.com/docs/developers/v3/deployed-contracts"
+                    "",
                 ]
                 
                 # 将发现的文档URL也添加到潜在页面列表
@@ -913,6 +985,12 @@ URL: {url}
                 for page_url in potential_contract_pages[:5]:  # 限制测试页面数量
                     try:
                         print(f"\n尝试访问: {page_url}")
+                        
+                        # 检查WebDriver会话是否有效
+                        if not self._check_driver_session():
+                            print("WebDriver会话无效，尝试重新初始化...")
+                            continue
+                            
                         self.driver.get(page_url)
                         WebDriverWait(self.driver, 10).until(
                             EC.presence_of_element_located((By.TAG_NAME, "body"))
@@ -941,6 +1019,13 @@ URL: {url}
                                 context = self._extract_address_context(page_soup, addr)
                                 print(f"\n地址 {i+1}: {addr}")
                                 print(f"上下文: {context[:200]}...")
+                    except WebDriverException as e:
+                        print(f"WebDriver错误: {e}")
+                        # 检查是否是无效会话ID错误
+                        if "invalid session id" in str(e).lower():
+                            print("检测到无效会话ID错误，尝试重新初始化WebDriver")
+                            self.driver_session_valid = False
+                            self._check_driver_session()
                     except Exception as e:
                         print(f"访问页面出错: {page_url}, 错误: {e}")
                 
@@ -958,30 +1043,178 @@ URL: {url}
                     print(f"\n地址 {i+1}: {addr}")
                     print(f"上下文: {context[:200]}...")
             
+        except WebDriverException as e:
+            logger.error(f"WebDriver错误: {e}")
+            # 检查是否是无效会话ID错误
+            if "invalid session id" in str(e).lower():
+                logger.warning("检测到无效会话ID错误，尝试重新初始化WebDriver")
+                self.driver_session_valid = False
+                self._check_driver_session()
         except Exception as e:
             logger.error(f"测试URL时出错: {e}")
         finally:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except:
+                pass  # 忽略关闭时的错误
+
+    def _check_driver_session(self):
+        """检查WebDriver会话是否有效，如果无效则重新初始化"""
+        if not self.driver_session_valid:
+            logger.info("WebDriver会话无效，尝试重新初始化...")
+            try:
+                # 尝试关闭旧的WebDriver实例
+                try:
+                    self.driver.quit()
+                except:
+                    pass  # 忽略关闭时的错误
+                
+                # 重新初始化WebDriver
+                self.driver = self._setup_webdriver()
+                self.driver_session_valid = True
+                logger.info("WebDriver会话已成功恢复")
+            except Exception as e:
+                logger.error(f"重新初始化WebDriver失败: {e}")
+                # 等待一段时间后再次尝试
+                time.sleep(5)
+                return False
+        return True
+
+    def _is_blacklisted(self, url: str) -> bool:
+        """检查URL是否在黑名单中"""
+        # 规范化URL
+        url = self._normalize_url(url)
+        
+        # 检查混合黑名单（支持通配符）
+        for pattern in self.mixed_blacklist:
+            if self._match_blacklist_pattern(url, pattern):
+                logger.debug(f"URL匹配黑名单规则: {url}, 匹配规则: {pattern}")
+                return True
+                
+        return False
+    
+    def _match_blacklist_pattern(self, url: str, pattern: str) -> bool:
+        """匹配黑名单模式，支持通配符"""
+        # 解析URL和模式
+        parsed_url = urllib.parse.urlparse(url)
+        domain = parsed_url.netloc
+        path = parsed_url.path
+        
+        # 如果模式不包含/，则认为只匹配域名
+        if '/' not in pattern:
+            # 域名精确匹配
+            if pattern == domain:
+                return True
             
-    def crawl(self, max_addresses: int = 3000, max_pages: int = 5000):
+            # 通配符匹配
+            if pattern.startswith('*'):
+                suffix = pattern[1:]
+                if domain.endswith(suffix):
+                    return True
+            elif pattern.endswith('*'):
+                prefix = pattern[:-1]
+                if domain.startswith(prefix):
+                    return True
+            
+            return False
+        
+        # 包含路径的模式
+        parts = pattern.split('/', 1)
+        pattern_domain = parts[0]
+        pattern_path = '/' + parts[1] if parts[1] else '/'
+        
+        # 先匹配域名部分
+        domain_match = False
+        
+        # 域名精确匹配
+        if pattern_domain == domain:
+            domain_match = True
+        # 通配符域名匹配
+        elif pattern_domain == '*':
+            domain_match = True
+        elif pattern_domain.startswith('*'):
+            suffix = pattern_domain[1:]
+            if domain.endswith(suffix):
+                domain_match = True
+        elif pattern_domain.endswith('*'):
+            prefix = pattern_domain[:-1]
+            if domain.startswith(prefix):
+                domain_match = True
+        
+        if not domain_match:
+            return False
+        
+        # 再匹配路径部分
+        # 精确匹配路径
+        if pattern_path == path:
+            return True
+        
+        # 通配符路径匹配
+        if pattern_path.endswith('*'):
+            prefix_path = pattern_path[:-1]
+            if path.startswith(prefix_path):
+                return True
+        
+        return False
+
+    def _is_same_root_domain(self, url1: str, url2: str) -> bool:
+        """判断两个URL是否属于相同的一级域名"""
+        try:
+            parsed_url1 = urllib.parse.urlparse(url1)
+            parsed_url2 = urllib.parse.urlparse(url2)
+            
+            # 获取两个URL的根域名
+            root_domain1 = self._get_root_domain(parsed_url1.netloc)
+            root_domain2 = self._get_root_domain(parsed_url2.netloc)
+            
+            # 比较根域名是否相同
+            return root_domain1 == root_domain2
+        except Exception as e:
+            logger.error(f"比较域名时出错: {e}")
+            return False
+
+    def crawl(self, max_addresses: int = 3000, max_pages: int = 3000):
         """爬取网站并提取合约地址"""
         # 设置OpenAI和WebDriver
         self._setup_openai()
-        self._setup_webdriver()
+        self.driver = self._setup_webdriver()
+        self.driver_session_valid = True
+        
+        # 获取基础URL的根域名，用于后续过滤
+        base_root_domain = self._get_root_domain(urllib.parse.urlparse(self.base_url).netloc)
+        logger.info(f"限制爬取范围在根域名: {base_root_domain}")
         
         # 检查是否有docs子域名
         self._check_for_docs_subdomain()
         
         visited_count = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 5
         
         try:
             while self.to_visit_urls and visited_count < max_pages and len(self.extracted_addresses) < max_addresses:
                 # 获取下一个URL
                 current_url = self.to_visit_urls.pop()
+                
+                # 检查URL是否在黑名单中
+                if self._is_blacklisted(current_url):
+                    logger.info(f"跳过黑名单URL: {current_url}")
+                    continue
+                
+                # 确保URL属于相同的根域名
+                if not self._is_same_root_domain(current_url, self.base_url):
+                    logger.info(f"跳过不同域名URL: {current_url}, 基础域名: {base_root_domain}")
+                    continue
+                
                 self.visited_urls.add(current_url)
                 visited_count += 1
                 
                 logger.info(f"[{visited_count}/{max_pages}] 访问: {current_url}")
+                
+                # 检查WebDriver会话是否有效
+                if not self._check_driver_session():
+                    logger.warning("无法恢复WebDriver会话，跳过当前URL")
+                    continue
                 
                 try:
                     # 访问页面
@@ -990,10 +1223,19 @@ URL: {url}
                         EC.presence_of_element_located((By.TAG_NAME, "body"))
                     )
                     
+                    # 重置连续错误计数
+                    consecutive_errors = 0
+                    
                     # 处理重定向 - 获取当前URL（可能与请求的URL不同）
                     final_url = self.driver.current_url
                     if final_url != current_url:
                         logger.info(f"重定向: {current_url} -> {final_url}")
+                        
+                        # 检查重定向后的URL是否在黑名单中
+                        if self._is_blacklisted(final_url):
+                            logger.info(f"重定向后的URL在黑名单中，跳过: {final_url}")
+                            continue
+                        
                         # 将最终URL也添加到已访问集合中
                         self.visited_urls.add(final_url)
                         # 使用最终URL进行后续处理
@@ -1040,20 +1282,37 @@ URL: {url}
                     
                 except TimeoutException:
                     logger.warning(f"页面加载超时: {current_url}")
+                    consecutive_errors += 1
                 except WebDriverException as e:
                     logger.warning(f"WebDriver错误: {e}")
+                    # 检查是否是无效会话ID错误
+                    if "invalid session id" in str(e).lower():
+                        logger.warning("检测到无效会话ID错误，标记WebDriver会话为无效")
+                        self.driver_session_valid = False
+                    consecutive_errors += 1
                 except Exception as e:
                     logger.error(f"处理页面时出错: {current_url}, 错误: {e}")
+                    consecutive_errors += 1
+                
+                # 检查连续错误次数
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.warning(f"检测到 {consecutive_errors} 次连续错误，尝试重新初始化WebDriver")
+                    self.driver_session_valid = False
+                    self._check_driver_session()
+                    consecutive_errors = 0
                 
                 # 显示进度
                 if visited_count % 10 == 0:
                     logger.info(f"已爬取 {visited_count} 个页面, 找到 {len(self.extracted_addresses)} 个合约地址")
                 
-                # 随机暂停2-6秒避免触发反爬机制
-                time.sleep(random.uniform(2, 6))
+                # 随机暂停2-8秒避免触发反爬机制
+                time.sleep(random.uniform(2, 8))
                 
         finally:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except:
+                pass  # 忽略关闭时的错误
             
         # 保存结果
         if self.address_contexts:
